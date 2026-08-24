@@ -1,251 +1,22 @@
-import asyncio
+import os
 import re
 import json
-import sqlite3
-import os
-import sys
-import threading
-import time
-import requests
 import base64
-from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, jsonify, send_from_directory
-from telethon import TelegramClient, events, errors
+import requests
+from datetime import datetime
+from flask import Flask, render_template_string, request, jsonify
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
 # ==================== CONFIG ====================
-API_ID = 33435112
-API_HASH = "89b7361a12dc0d54dd1973c8a95647b6"
-USER_PHONE = "+917970462807"
-TARGET_BOT = "ff_accessXtoken_bot"
-JWT_API = "https://ff-jwt-gen-api.lovable.app/api/public/token"
+API_ID = int(os.environ.get('API_ID', 33435112))
+API_HASH = os.environ.get('API_HASH', '89b7361a12dc0d54dd1973c8a95647b6')
+USER_PHONE = os.environ.get('USER_PHONE', '+9197970462807')
+TARGET_BOT = os.environ.get('TARGET_BOT', 'ff_accessXtoken_bot')
+JWT_API = os.environ.get('JWT_API', 'https://ff-jwt-gen-api.lovable.app/api/public/token')
 
 # ==================== FLASK APP ====================
 app = Flask(__name__)
-
-# ==================== DATABASE ====================
-DB_PATH = "tokens.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS tokens (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        open_id TEXT,
-        access_token TEXT,
-        uid TEXT,
-        name TEXT,
-        jwt TEXT,
-        captured_at TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        phone TEXT,
-        session_string TEXT,
-        created_at TEXT
-    )''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ==================== TELEGRAM CLIENT ====================
-client = None
-is_logged_in = False
-checking = False
-check_timer = None
-last_token = None
-pending_phone = None
-pending_phone_code_hash = None
-
-def get_session():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT session_string FROM sessions ORDER BY id DESC LIMIT 1")
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-def save_session(session_string):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO sessions (phone, session_string, created_at) VALUES (?, ?, ?)",
-               (USER_PHONE, session_string, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-def save_token(open_id, access_token, uid, name, jwt):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO tokens (open_id, access_token, uid, name, jwt, captured_at) VALUES (?, ?, ?, ?, ?, ?)",
-               (open_id, access_token, uid, name, jwt, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-def get_tokens():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, open_id, uid, name, jwt, captured_at FROM tokens ORDER BY id DESC")
-    result = c.fetchall()
-    conn.close()
-    return result
-
-# ==================== TELEGRAM LOGIN ====================
-async def login_telegram(phone, code=None, phone_code_hash=None):
-    global client, is_logged_in, pending_phone, pending_phone_code_hash
-    
-    try:
-        session_str = get_session()
-        if session_str:
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        else:
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-        
-        await client.connect()
-        
-        if await client.is_user_authorized():
-            is_logged_in = True
-            me = await client.get_me()
-            return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
-        
-        if code and phone_code_hash:
-            try:
-                await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
-                me = await client.get_me()
-                is_logged_in = True
-                save_session(client.session.save())
-                return {"success": True, "message": f"Logged in as {me.first_name}", "username": me.username}
-            except errors.rpcerrorlist.PhoneCodeInvalidError:
-                return {"success": False, "message": "Invalid verification code"}
-            except errors.rpcerrorlist.PhoneCodeExpiredError:
-                return {"success": False, "message": "Verification code expired. Please try again."}
-            except errors.rpcerrorlist.SessionPasswordNeededError:
-                return {"success": False, "message": "2FA is enabled. Please enter your password."}
-            except Exception as e:
-                return {"success": False, "message": str(e)}
-        else:
-            # Send code request
-            try:
-                send_code_result = await client.send_code_request(phone)
-                phone_code_hash = send_code_result.phone_code_hash
-                pending_phone = phone
-                pending_phone_code_hash = phone_code_hash
-                return {"success": False, "need_code": True, "message": "Verification code sent to your Telegram", "phone_code_hash": phone_code_hash}
-            except errors.rpcerrorlist.PhoneNumberInvalidError:
-                return {"success": False, "message": "Invalid phone number"}
-            except errors.rpcerrorlist.FloodWaitError as e:
-                return {"success": False, "message": f"Too many attempts. Please wait {e.seconds} seconds."}
-            except Exception as e:
-                return {"success": False, "message": str(e)}
-            
-    except errors.rpcerrorlist.PhoneNumberInvalidError:
-        return {"success": False, "message": "Invalid phone number"}
-    except errors.rpcerrorlist.PhoneCodeInvalidError:
-        return {"success": False, "message": "Invalid verification code"}
-    except errors.rpcerrorlist.PhoneCodeExpiredError:
-        return {"success": False, "message": "Verification code expired. Please try again."}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-# ==================== CAPTURE TOKEN ====================
-async def capture_token():
-    global last_token
-    
-    if not client:
-        return {"success": False, "message": "Not logged in"}
-    
-    try:
-        if not await client.is_user_authorized():
-            return {"success": False, "message": "Session expired"}
-        
-        # Open bot
-        await client.send_message(f"@{TARGET_BOT}", "/start")
-        await asyncio.sleep(2)
-        
-        # Get messages
-        async for message in client.iter_messages(f"@{TARGET_BOT}", limit=10):
-            if message.text and "ɴᴇᴡ ʟᴏɢɪɴ ᴄᴀᴘᴛᴜʀᴇᴅ" in message.text:
-                # Extract token and open_id
-                token_match = re.search(r'ᴀᴄᴄᴇss ᴛᴏᴋᴇɴ\s*`([a-f0-9]+)`', message.text, re.I)
-                open_id_match = re.search(r'ᴏᴘᴇɴ ɪᴅ\s*`([a-f0-9]+)`', message.text, re.I)
-                
-                if token_match:
-                    access_token = token_match.group(1)
-                    open_id = open_id_match.group(1) if open_id_match else None
-                    
-                    # Check if already captured
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
-                    c.execute("SELECT id FROM tokens WHERE access_token = ?", (access_token,))
-                    existing = c.fetchone()
-                    conn.close()
-                    
-                    if existing:
-                        return {"success": True, "message": "Token already captured", "new": False}
-                    
-                    # Get JWT from API
-                    jwt = None
-                    uid = None
-                    name = None
-                    
-                    try:
-                        response = requests.get(f"{JWT_API}?access_token={access_token}", timeout=30)
-                        if response.status_code == 200:
-                            data = response.json()
-                            jwt = data.get('token')
-                            uid = data.get('account_uid') or data.get('Uid')
-                            
-                            # Decode nickname from JWT payload
-                            payload = data.get('jwt_decoded', {}).get('payload', {})
-                            name = payload.get('nickname')
-                            if name:
-                                try:
-                                    name = base64.b64decode(name).decode('utf-8')
-                                except:
-                                    pass
-                    except Exception as e:
-                        print(f"JWT API error: {e}")
-                    
-                    # Save
-                    save_token(open_id, access_token, uid, name, jwt)
-                    last_token = {"access_token": access_token, "open_id": open_id, "uid": uid, "name": name, "jwt": jwt}
-                    
-                    return {"success": True, "message": "Token captured!", "new": True, "token": last_token}
-        
-        return {"success": True, "message": "No new token found", "new": False}
-        
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-# ==================== BACKGROUND CHECK ====================
-def run_async_check():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    return loop.run_until_complete(capture_token())
-
-def check_loop():
-    global checking
-    while checking:
-        try:
-            result = run_async_check()
-            print(f"[CHECK] {result}")
-        except Exception as e:
-            print(f"[ERROR] {e}")
-        time.sleep(1)
-
-def start_check():
-    global checking, check_timer
-    if checking:
-        return {"success": False, "message": "Already running"}
-    checking = True
-    check_timer = threading.Thread(target=check_loop, daemon=True)
-    check_timer.start()
-    return {"success": True, "message": "Started checking"}
-
-def stop_check():
-    global checking
-    checking = False
-    return {"success": True, "message": "Stopped checking"}
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
@@ -805,18 +576,159 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
+# ==================== IN-MEMORY STORAGE (Vercel Compatible) ====================
+# Vercel doesn't support persistent file storage, so we use in-memory
+# For production, use a database like Vercel Postgres or Supabase
+tokens_store = []
+sessions_store = {}
+pending_phone_code_hash_store = {}
+
+# ==================== TELEGRAM LOGIN FUNCTIONS ====================
+async def login_telegram(phone, code=None, phone_code_hash=None):
+    try:
+        # Check if session exists in memory
+        session_str = sessions_store.get(phone)
+        if session_str:
+            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        else:
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+        
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
+        
+        if code and phone_code_hash:
+            try:
+                await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                me = await client.get_me()
+                sessions_store[phone] = client.session.save()
+                return {"success": True, "message": f"Logged in as {me.first_name}", "username": me.username}
+            except errors.rpcerrorlist.PhoneCodeInvalidError:
+                return {"success": False, "message": "Invalid verification code"}
+            except errors.rpcerrorlist.PhoneCodeExpiredError:
+                return {"success": False, "message": "Verification code expired. Please try again."}
+            except errors.rpcerrorlist.SessionPasswordNeededError:
+                return {"success": False, "message": "2FA is enabled. Please enter your password."}
+            except Exception as e:
+                return {"success": False, "message": str(e)}
+        else:
+            try:
+                send_code_result = await client.send_code_request(phone)
+                phone_code_hash = send_code_result.phone_code_hash
+                pending_phone_code_hash_store[phone] = phone_code_hash
+                return {"success": False, "need_code": True, "message": "Verification code sent", "phone_code_hash": phone_code_hash}
+            except errors.rpcerrorlist.PhoneNumberInvalidError:
+                return {"success": False, "message": "Invalid phone number"}
+            except errors.rpcerrorlist.FloodWaitError as e:
+                return {"success": False, "message": f"Too many attempts. Please wait {e.seconds} seconds."}
+            except Exception as e:
+                return {"success": False, "message": str(e)}
+            
+    except errors.rpcerrorlist.PhoneNumberInvalidError:
+        return {"success": False, "message": "Invalid phone number"}
+    except errors.rpcerrorlist.PhoneCodeInvalidError:
+        return {"success": False, "message": "Invalid verification code"}
+    except errors.rpcerrorlist.PhoneCodeExpiredError:
+        return {"success": False, "message": "Verification code expired. Please try again."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+async def capture_token():
+    try:
+        # Get first session from memory
+        if not sessions_store:
+            return {"success": False, "message": "Not logged in"}
+        
+        phone = list(sessions_store.keys())[0]
+        session_str = sessions_store[phone]
+        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            return {"success": False, "message": "Session expired"}
+        
+        # Open bot
+        await client.send_message(f"@{TARGET_BOT}", "/start")
+        await asyncio.sleep(2)
+        
+        # Get messages
+        async for message in client.iter_messages(f"@{TARGET_BOT}", limit=10):
+            if message.text and "ɴᴇᴡ ʟᴏɢɪɴ ᴄᴀᴘᴛᴜʀᴇᴅ" in message.text:
+                token_match = re.search(r'ᴀᴄᴄᴇss ᴛᴏᴋᴇɴ\s*`([a-f0-9]+)`', message.text, re.I)
+                open_id_match = re.search(r'ᴏᴘᴇɴ ɪᴅ\s*`([a-f0-9]+)`', message.text, re.I)
+                
+                if token_match:
+                    access_token = token_match.group(1)
+                    open_id = open_id_match.group(1) if open_id_match else None
+                    
+                    # Check if already captured
+                    for token in tokens_store:
+                        if token.get('access_token') == access_token:
+                            return {"success": True, "message": "Token already captured", "new": False}
+                    
+                    # Get JWT from API
+                    jwt = None
+                    uid = None
+                    name = None
+                    
+                    try:
+                        response = requests.get(f"{JWT_API}?access_token={access_token}", timeout=30)
+                        if response.status_code == 200:
+                            data = response.json()
+                            jwt = data.get('token')
+                            uid = data.get('account_uid') or data.get('Uid')
+                            payload = data.get('jwt_decoded', {}).get('payload', {})
+                            name = payload.get('nickname')
+                            if name:
+                                try:
+                                    name = base64.b64decode(name).decode('utf-8')
+                                except:
+                                    pass
+                    except Exception as e:
+                        print(f"JWT API error: {e}")
+                    
+                    token_data = {
+                        "open_id": open_id,
+                        "access_token": access_token,
+                        "uid": uid,
+                        "name": name,
+                        "jwt": jwt,
+                        "captured_at": datetime.now().isoformat()
+                    }
+                    tokens_store.append(token_data)
+                    
+                    return {"success": True, "message": "Token captured!", "new": True, "token": token_data}
+        
+        return {"success": True, "message": "No new token found", "new": False}
+        
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
 # ==================== FLASK ROUTES ====================
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/api/status')
+def api_status():
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "tokens_count": len(tokens_store),
+        "sessions_count": len(sessions_store)
+    })
+
 @app.route('/api/login', methods=['POST'])
 def api_login():
+    import asyncio
     data = request.json
     phone = data.get('phone')
     
     if not phone:
-        return jsonify({"success": False, "message": "Phone required"})
+        return jsonify({"success": False, "message": "Phone required"}), 400
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -825,13 +737,14 @@ def api_login():
 
 @app.route('/api/verify', methods=['POST'])
 def api_verify():
+    import asyncio
     data = request.json
     phone = data.get('phone')
     code = data.get('code')
     phone_code_hash = data.get('phone_code_hash')
     
     if not phone or not code:
-        return jsonify({"success": False, "message": "Phone and code required"})
+        return jsonify({"success": False, "message": "Phone and code required"}), 400
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -840,6 +753,7 @@ def api_verify():
 
 @app.route('/api/check-token')
 def api_check_token():
+    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     result = loop.run_until_complete(capture_token())
@@ -847,44 +761,33 @@ def api_check_token():
 
 @app.route('/api/tokens')
 def api_tokens():
-    tokens = get_tokens()
-    token_list = []
-    for t in tokens:
-        token_list.append({
-            'id': t[0],
-            'open_id': t[1],
-            'uid': t[2],
-            'name': t[3],
-            'jwt': t[4],
-            'captured_at': t[5]
-        })
-    return jsonify({"success": True, "tokens": token_list})
+    return jsonify({"success": True, "tokens": tokens_store})
 
 @app.route('/api/start-check', methods=['POST'])
 def api_start_check():
-    return jsonify(start_check())
+    # Vercel doesn't support background threads
+    # This is a placeholder - actual auto-check would need a separate worker
+    return jsonify({"success": True, "message": "Auto-check started (simulated)"})
 
 @app.route('/api/stop-check', methods=['POST'])
 def api_stop_check():
-    return jsonify(stop_check())
+    return jsonify({"success": True, "message": "Auto-check stopped (simulated)"})
 
-@app.route('/api/status')
-def api_status():
-    return jsonify({
-        "logged_in": is_logged_in,
-        "checking": checking,
-        "last_token": last_token
-    })
+# ==================== FOR VERCEL ====================
+# This is the handler that Vercel uses
+def handler(request, context):
+    return app(request, context)
 
-# ==================== MAIN ====================
+# ==================== MAIN (Local Development Only) ====================
 if __name__ == '__main__':
     print("=" * 60)
-    print("🔥 FF TOKEN MANAGER - Complete Server")
+    print("🔥 FF TOKEN MANAGER - Vercel Compatible")
     print("=" * 60)
     print(f"📱 Phone: {USER_PHONE}")
     print(f"🤖 Target Bot: @{TARGET_BOT}")
     print(f"🔑 JWT API: {JWT_API}")
     print("=" * 60)
     print("🌐 Server running at http://localhost:5000")
+    print("⚠️  Note: Vercel uses in-memory storage only")
     print("=" * 60)
     app.run(host='0.0.0.0', port=5000, debug=False)
