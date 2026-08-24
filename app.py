@@ -4,7 +4,7 @@ import json
 import base64
 import asyncio
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify, session
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
@@ -12,7 +12,7 @@ from telethon.sessions import StringSession
 # ==================== CONFIG ====================
 API_ID = int(os.environ.get('API_ID', 33435112))
 API_HASH = os.environ.get('API_HASH', '89b7361a12dc0d54dd1973c8a95647b6')
-USER_PHONE = os.environ.get('USER_PHONE', '+917970462807')
+USER_PHONE = os.environ.get('USER_PHONE', '+9197970462807')
 TARGET_BOT = os.environ.get('TARGET_BOT', 'ff_accessXtoken_bot')
 JWT_API = os.environ.get('JWT_API', 'https://ff-jwt-gen-api.lovable.app/api/public/token')
 
@@ -22,8 +22,20 @@ app.secret_key = os.environ.get('SECRET_KEY', 'ff-token-manager-secret-key-2024'
 
 # ==================== IN-MEMORY STORAGE ====================
 tokens_store = []
-sessions_store = {}
-pending_data = {}  # phone: {"client": client, "phone_code_hash": hash}
+sessions_store = {}  # phone: session_string
+pending_data = {}    # phone: {"client": client, "phone_code_hash": hash}
+
+# ==================== GLOBAL EVENT LOOP ====================
+# Single event loop for all Telegram operations
+_loop = None
+
+def get_event_loop():
+    """Get or create a single event loop"""
+    global _loop
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+    return _loop
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
@@ -486,7 +498,7 @@ HTML_TEMPLATE = '''
                 </div>
                 
                 <div class="login-input" id="loginInput">
-                    <input type="text" id="phoneInput" placeholder="+917970462807" value="+917970462807">
+                    <input type="text" id="phoneInput" placeholder="+9197970462807" value="+9197970462807">
                     <button class="login-btn" onclick="sendOTP()">📤 Send OTP</button>
                 </div>
                 
@@ -667,6 +679,34 @@ HTML_TEMPLATE = '''
                     document.getElementById('loggedUser').textContent = data.username || pendingPhone;
                     document.getElementById('loginInput').style.display = 'none';
                     loadTokens();
+                } else if (data.need_2fa) {
+                    const password = prompt('🔐 2FA is enabled. Enter your password:');
+                    if (password) {
+                        const verifyResponse = await fetch('/api/verify-2fa', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ 
+                                phone: pendingPhone, 
+                                password: password
+                            })
+                        });
+                        const verifyData = await verifyResponse.json();
+                        if (verifyData.success) {
+                            status.innerHTML = '✅ ' + verifyData.message;
+                            status.className = 'status-text success';
+                            showToast('✅ Login successful with 2FA!', 'success');
+                            document.getElementById('otpSection').classList.remove('active');
+                            document.getElementById('otpInput').value = '';
+                            document.getElementById('loginStatus').classList.add('active');
+                            document.getElementById('loggedUser').textContent = verifyData.username || pendingPhone;
+                            document.getElementById('loginInput').style.display = 'none';
+                            loadTokens();
+                        } else {
+                            status.innerHTML = '❌ ' + verifyData.message;
+                            status.className = 'status-text error';
+                            showToast('❌ ' + verifyData.message, 'error');
+                        }
+                    }
                 } else {
                     status.innerHTML = '❌ ' + data.message;
                     status.className = 'status-text error';
@@ -773,7 +813,11 @@ HTML_TEMPLATE = '''
             } catch (error) { console.error('Check error:', error); }
         }
 
-        // Enter key support
+        document.addEventListener('DOMContentLoaded', function() {
+            checkLoginStatus();
+            showToast('🔥 Welcome! Enter phone and click Send OTP', 'success');
+        });
+
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
                 const phoneInput = document.getElementById('phoneInput');
@@ -782,34 +826,38 @@ HTML_TEMPLATE = '''
                 else if (document.activeElement === otpInput) verifyOTP();
             }
         });
-
-        document.addEventListener('DOMContentLoaded', function() {
-            checkLoginStatus();
-            showToast('🔥 Welcome! Enter phone and click Send OTP', 'success');
-        });
     </script>
 </body>
 </html>
 '''
 
-# ==================== FIXED TELEGRAM FUNCTIONS ====================
+# ==================== TELEGRAM FUNCTIONS WITH SINGLE EVENT LOOP ====================
+def run_async(func, *args, **kwargs):
+    """Run async function using the global event loop"""
+    loop = get_event_loop()
+    return loop.run_until_complete(func(*args, **kwargs))
+
+async def get_or_create_client(phone):
+    """Get existing client or create new one"""
+    # Check if we have a pending client
+    if phone in pending_data:
+        client = pending_data[phone].get('client')
+        if client and client.is_connected():
+            return client, True
+    
+    # Check if we have a saved session
+    session_str = sessions_store.get(phone)
+    if session_str:
+        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    else:
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+    
+    await client.connect()
+    return client, False
+
 async def do_login(phone, code=None, phone_code_hash=None):
     try:
-        # Check if we have a pending client
-        client = None
-        phone_code_hash_to_use = phone_code_hash
-        
-        if phone in pending_data:
-            client = pending_data[phone].get('client')
-            phone_code_hash_to_use = pending_data[phone].get('phone_code_hash')
-        
-        if client is None:
-            session_str = sessions_store.get(phone)
-            if session_str:
-                client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            else:
-                client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
+        client, is_pending = await get_or_create_client(phone)
         
         # Check if already authorized
         if await client.is_user_authorized():
@@ -820,9 +868,9 @@ async def do_login(phone, code=None, phone_code_hash=None):
             return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
         
         # If code provided, verify
-        if code and phone_code_hash_to_use:
+        if code and phone_code_hash:
             try:
-                await client.sign_in(phone, code, phone_code_hash=phone_code_hash_to_use)
+                await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
                 me = await client.get_me()
                 sessions_store[phone] = client.session.save()
                 if phone in pending_data:
@@ -833,7 +881,7 @@ async def do_login(phone, code=None, phone_code_hash=None):
             except errors.rpcerrorlist.PhoneCodeExpiredError:
                 return {"success": False, "message": "Verification code expired. Please request new OTP."}
             except errors.rpcerrorlist.SessionPasswordNeededError:
-                return {"success": False, "message": "2FA is enabled. Please enter your password."}
+                return {"success": False, "message": "2FA is enabled", "need_2fa": True}
             except Exception as e:
                 return {"success": False, "message": str(e)}
         else:
@@ -856,6 +904,33 @@ async def do_login(phone, code=None, phone_code_hash=None):
         return {"success": False, "message": "Invalid verification code"}
     except errors.rpcerrorlist.PhoneCodeExpiredError:
         return {"success": False, "message": "Verification code expired. Please request new OTP."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+async def do_login_2fa(phone, password):
+    try:
+        if phone not in pending_data:
+            return {"success": False, "message": "No pending login found"}
+        
+        client = pending_data[phone].get('client')
+        if not client:
+            return {"success": False, "message": "Client not found"}
+        
+        if not client.is_connected():
+            await client.connect()
+        
+        try:
+            await client.sign_in(password=password)
+            me = await client.get_me()
+            sessions_store[phone] = client.session.save()
+            if phone in pending_data:
+                del pending_data[phone]
+            return {"success": True, "message": f"Logged in as {me.first_name}", "username": me.username}
+        except errors.rpcerrorlist.PasswordHashInvalidError:
+            return {"success": False, "message": "Invalid 2FA password"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+            
     except Exception as e:
         return {"success": False, "message": str(e)}
 
@@ -946,6 +1021,14 @@ def api_status():
 
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
+    # Clean up pending clients
+    for phone in list(pending_data.keys()):
+        try:
+            client = pending_data[phone].get('client')
+            if client:
+                client.disconnect()
+        except:
+            pass
     sessions_store.clear()
     pending_data.clear()
     return jsonify({"success": True, "message": "Logged out"})
@@ -958,9 +1041,7 @@ def api_login():
     if not phone:
         return jsonify({"success": False, "message": "Phone required"}), 400
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(do_login(phone))
+    result = run_async(do_login, phone)
     return jsonify(result)
 
 @app.route('/api/verify', methods=['POST'])
@@ -973,16 +1054,24 @@ def api_verify():
     if not phone or not code:
         return jsonify({"success": False, "message": "Phone and code required"}), 400
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(do_login(phone, code, phone_code_hash))
+    result = run_async(do_login, phone, code, phone_code_hash)
+    return jsonify(result)
+
+@app.route('/api/verify-2fa', methods=['POST'])
+def api_verify_2fa():
+    data = request.json
+    phone = data.get('phone')
+    password = data.get('password')
+    
+    if not phone or not password:
+        return jsonify({"success": False, "message": "Phone and password required"}), 400
+    
+    result = run_async(do_login_2fa, phone, password)
     return jsonify(result)
 
 @app.route('/api/check-token')
 def api_check_token():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(do_capture_token())
+    result = run_async(do_capture_token)
     return jsonify(result)
 
 @app.route('/api/tokens')
@@ -1004,7 +1093,7 @@ def handler(request, context):
 # ==================== MAIN ====================
 if __name__ == '__main__':
     print("=" * 60)
-    print("🔥 FF TOKEN MANAGER - Vercel Compatible")
+    print("🔥 FF TOKEN MANAGER - Production Ready")
     print("=" * 60)
     print(f"📱 Phone: {USER_PHONE}")
     print(f"🤖 Target Bot: @{TARGET_BOT}")
