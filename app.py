@@ -22,7 +22,7 @@ app = Flask(__name__)
 # ==================== IN-MEMORY STORAGE ====================
 tokens_store = []
 sessions_store = {}
-pending_data = {}  # Store phone_code_hash per phone
+pending_data = {}
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
@@ -159,7 +159,7 @@ HTML_TEMPLATE = '''
         .login-input {
             display: flex;
             gap: 10px;
-            margin-bottom: 15px;
+            margin-bottom: 10px;
         }
         .login-input input {
             flex: 1;
@@ -195,6 +195,65 @@ HTML_TEMPLATE = '''
             transform: scale(1.05);
             box-shadow: 0 0 30px rgba(255,107,53,0.3);
         }
+        .otp-section {
+            display: none;
+            margin-top: 10px;
+            padding: 15px;
+            background: rgba(255,255,255,0.03);
+            border-radius: 15px;
+            border: 1px solid rgba(255,107,53,0.15);
+        }
+        .otp-section.active {
+            display: block;
+            animation: fadeIn 0.5s ease;
+        }
+        @keyframes fadeIn {
+            0% { opacity: 0; transform: translateY(-10px); }
+            100% { opacity: 1; transform: translateY(0); }
+        }
+        .otp-input {
+            display: flex;
+            gap: 10px;
+        }
+        .otp-input input {
+            flex: 1;
+            padding: 12px 15px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            color: #fff;
+            font-size: 18px;
+            font-family: 'Orbitron', sans-serif;
+            text-align: center;
+            letter-spacing: 5px;
+            outline: none;
+            transition: all 0.3s ease;
+        }
+        .otp-input input:focus {
+            border-color: #ff6b35;
+            box-shadow: 0 0 20px rgba(255,107,53,0.1);
+        }
+        .otp-input .verify-btn {
+            padding: 12px 25px;
+            background: linear-gradient(135deg, #00ff88, #00cc66);
+            border: none;
+            border-radius: 12px;
+            color: #fff;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            white-space: nowrap;
+        }
+        .otp-input .verify-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 30px rgba(0,255,136,0.3);
+        }
+        .otp-info {
+            color: rgba(255,255,255,0.5);
+            font-size: 12px;
+            margin-top: 8px;
+            text-align: center;
+        }
         .status-text {
             color: rgba(255,255,255,0.6);
             font-size: 13px;
@@ -203,9 +262,11 @@ HTML_TEMPLATE = '''
             border-radius: 10px;
             border: 1px solid rgba(255,255,255,0.05);
             min-height: 40px;
+            margin-top: 10px;
         }
         .status-text.success { color: #00ff88; border-color: rgba(0,255,136,0.2); }
         .status-text.error { color: #ff4444; border-color: rgba(255,68,68,0.2); }
+        .status-text.info { color: #ff6b35; border-color: rgba(255,107,53,0.2); }
         .auto-check-section {
             background: rgba(255,107,53,0.05);
             border: 1px solid rgba(255,107,53,0.15);
@@ -357,6 +418,8 @@ HTML_TEMPLATE = '''
             .card { padding: 20px 15px; }
             .login-input { flex-direction: column; }
             .login-btn { width: 100%; }
+            .otp-input { flex-direction: column; }
+            .otp-input .verify-btn { width: 100%; }
             .auto-check-controls { flex-wrap: wrap; }
             .auto-check-btn { flex: 1; min-width: 60px; }
         }
@@ -376,10 +439,19 @@ HTML_TEMPLATE = '''
             <div class="login-section">
                 <h3>🔐 Login to Telegram</h3>
                 <div class="login-input">
-                    <input type="text" id="phoneInput" placeholder="+9197970462807" value="+9197970462807">
-                    <button class="login-btn" onclick="loginTelegram()">🚀 Login</button>
+                    <input type="text" id="phoneInput" placeholder="+917970462807" value="+917970462807">
+                    <button class="login-btn" onclick="sendOTP()">📤 Send OTP</button>
                 </div>
-                <div class="status-text" id="statusText">💡 Enter phone number and click Login</div>
+                
+                <div class="otp-section" id="otpSection">
+                    <div class="otp-input">
+                        <input type="text" id="otpInput" placeholder="Enter OTP" maxlength="6">
+                        <button class="verify-btn" onclick="verifyOTP()">✅ Verify</button>
+                    </div>
+                    <div class="otp-info">📱 Check your Telegram app for verification code</div>
+                </div>
+                
+                <div class="status-text" id="statusText">💡 Enter phone number and click Send OTP</div>
             </div>
 
             <div class="auto-check-section">
@@ -414,8 +486,8 @@ HTML_TEMPLATE = '''
         let checkInterval = null;
         let isRunning = false;
         let checkCount = 0;
-        let pendingPhoneCodeHash = null;
         let pendingPhone = null;
+        let pendingPhoneCodeHash = null;
 
         function showToast(message, type = 'success') {
             const toast = document.getElementById('toast');
@@ -424,12 +496,18 @@ HTML_TEMPLATE = '''
             setTimeout(() => { toast.className = 'toast'; }, 5000);
         }
 
-        async function loginTelegram() {
+        async function sendOTP() {
             const phone = document.getElementById('phoneInput').value.trim();
             const status = document.getElementById('statusText');
-            if (!phone) { showToast('❌ Please enter phone number', 'error'); return; }
-            status.innerHTML = '<div class="spinner"></div> Logging in...';
-            status.className = 'status-text';
+            
+            if (!phone) {
+                showToast('❌ Please enter phone number', 'error');
+                return;
+            }
+            
+            status.innerHTML = '<div class="spinner"></div> Sending OTP...';
+            status.className = 'status-text info';
+            
             try {
                 const response = await fetch('/api/login', {
                     method: 'POST',
@@ -437,41 +515,76 @@ HTML_TEMPLATE = '''
                     body: JSON.stringify({ phone: phone })
                 });
                 const data = await response.json();
+                
                 if (data.success) {
                     status.innerHTML = '✅ ' + data.message;
                     status.className = 'status-text success';
-                    showToast('✅ Login successful!', 'success');
+                    showToast('✅ Already logged in!', 'success');
+                    document.getElementById('otpSection').classList.remove('active');
                     loadTokens();
                 } else if (data.need_code) {
                     pendingPhone = phone;
                     pendingPhoneCodeHash = data.phone_code_hash;
-                    const code = prompt('📱 Enter verification code sent to your Telegram:\n(Check your Telegram app)');
-                    if (code) {
-                        const verifyResponse = await fetch('/api/verify', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ 
-                                phone: phone, 
-                                code: code,
-                                phone_code_hash: pendingPhoneCodeHash 
-                            })
-                        });
-                        const verifyData = await verifyResponse.json();
-                        if (verifyData.success) {
-                            status.innerHTML = '✅ ' + verifyData.message;
-                            status.className = 'status-text success';
-                            showToast('✅ Login successful!', 'success');
-                            loadTokens();
-                        } else {
-                            status.innerHTML = '❌ ' + verifyData.message;
-                            status.className = 'status-text error';
-                            showToast('❌ ' + verifyData.message, 'error');
-                        }
-                    }
+                    status.innerHTML = '✅ ' + data.message + ' - Enter OTP below';
+                    status.className = 'status-text success';
+                    document.getElementById('otpSection').classList.add('active');
+                    document.getElementById('otpInput').focus();
+                    showToast('📱 OTP sent to your Telegram!', 'success');
                 } else {
                     status.innerHTML = '❌ ' + data.message;
                     status.className = 'status-text error';
                     showToast('❌ ' + data.message, 'error');
+                }
+            } catch (error) {
+                status.innerHTML = '❌ Connection error';
+                status.className = 'status-text error';
+                showToast('❌ Connection error', 'error');
+            }
+        }
+
+        async function verifyOTP() {
+            const code = document.getElementById('otpInput').value.trim();
+            const status = document.getElementById('statusText');
+            
+            if (!code) {
+                showToast('❌ Please enter OTP', 'error');
+                return;
+            }
+            
+            if (!pendingPhone || !pendingPhoneCodeHash) {
+                showToast('❌ Please send OTP first', 'error');
+                return;
+            }
+            
+            status.innerHTML = '<div class="spinner"></div> Verifying OTP...';
+            status.className = 'status-text info';
+            
+            try {
+                const response = await fetch('/api/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        phone: pendingPhone, 
+                        code: code,
+                        phone_code_hash: pendingPhoneCodeHash 
+                    })
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    status.innerHTML = '✅ ' + data.message;
+                    status.className = 'status-text success';
+                    showToast('✅ Login successful!', 'success');
+                    document.getElementById('otpSection').classList.remove('active');
+                    document.getElementById('otpInput').value = '';
+                    loadTokens();
+                } else {
+                    status.innerHTML = '❌ ' + data.message;
+                    status.className = 'status-text error';
+                    showToast('❌ ' + data.message, 'error');
+                    if (data.message.includes('expired')) {
+                        document.getElementById('otpSection').classList.remove('active');
+                    }
                 }
             } catch (error) {
                 status.innerHTML = '❌ Connection error';
@@ -568,16 +681,19 @@ HTML_TEMPLATE = '''
             } catch (error) { console.error('Check error:', error); }
         }
 
-        document.addEventListener('DOMContentLoaded', function() {
-            loadTokens();
-            showToast('🔥 Welcome! Login to start', 'success');
-        });
-
+        // Enter key support
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
                 const phoneInput = document.getElementById('phoneInput');
-                if (document.activeElement === phoneInput) loginTelegram();
+                const otpInput = document.getElementById('otpInput');
+                if (document.activeElement === phoneInput) sendOTP();
+                else if (document.activeElement === otpInput) verifyOTP();
             }
+        });
+
+        document.addEventListener('DOMContentLoaded', function() {
+            loadTokens();
+            showToast('🔥 Welcome! Enter phone and click Send OTP', 'success');
         });
     </script>
 </body>
@@ -587,7 +703,6 @@ HTML_TEMPLATE = '''
 # ==================== TELEGRAM FUNCTIONS ====================
 async def do_login(phone, code=None, phone_code_hash=None):
     try:
-        # Check if session exists
         session_str = sessions_store.get(phone)
         if session_str:
             client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
@@ -596,12 +711,10 @@ async def do_login(phone, code=None, phone_code_hash=None):
         
         await client.connect()
         
-        # Check if already authorized
         if await client.is_user_authorized():
             me = await client.get_me()
             return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
         
-        # If code provided, verify
         if code and phone_code_hash:
             try:
                 await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
@@ -611,18 +724,17 @@ async def do_login(phone, code=None, phone_code_hash=None):
             except errors.rpcerrorlist.PhoneCodeInvalidError:
                 return {"success": False, "message": "Invalid verification code"}
             except errors.rpcerrorlist.PhoneCodeExpiredError:
-                return {"success": False, "message": "Verification code expired. Please try again."}
+                return {"success": False, "message": "Verification code expired. Please request new OTP."}
             except errors.rpcerrorlist.SessionPasswordNeededError:
                 return {"success": False, "message": "2FA is enabled. Please enter your password."}
             except Exception as e:
                 return {"success": False, "message": str(e)}
         else:
-            # Send code
             try:
                 send_code_result = await client.send_code_request(phone)
                 phone_code_hash = send_code_result.phone_code_hash
-                pending_data[phone] = {"phone_code_hash": phone_code_hash, "client": client}
-                return {"success": False, "need_code": True, "message": "Verification code sent", "phone_code_hash": phone_code_hash}
+                pending_data[phone] = {"phone_code_hash": phone_code_hash}
+                return {"success": False, "need_code": True, "message": "OTP sent to Telegram", "phone_code_hash": phone_code_hash}
             except errors.rpcerrorlist.PhoneNumberInvalidError:
                 return {"success": False, "message": "Invalid phone number"}
             except errors.rpcerrorlist.FloodWaitError as e:
@@ -635,7 +747,7 @@ async def do_login(phone, code=None, phone_code_hash=None):
     except errors.rpcerrorlist.PhoneCodeInvalidError:
         return {"success": False, "message": "Invalid verification code"}
     except errors.rpcerrorlist.PhoneCodeExpiredError:
-        return {"success": False, "message": "Verification code expired. Please try again."}
+        return {"success": False, "message": "Verification code expired. Please request new OTP."}
     except Exception as e:
         return {"success": False, "message": str(e)}
 
