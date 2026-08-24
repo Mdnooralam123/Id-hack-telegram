@@ -7,7 +7,7 @@ import requests
 import threading
 import time
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, jsonify, session
+from flask import Flask, render_template_string, request, jsonify, session, stream_with_context, Response
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
@@ -31,6 +31,8 @@ checking_active = False
 check_thread = None
 last_check_time = None
 check_count = 0
+live_logs = []  # Store live logs
+max_logs = 100  # Max logs to keep
 
 # ==================== GLOBAL EVENT LOOP ====================
 _loop = None
@@ -46,6 +48,19 @@ def run_async(func, *args, **kwargs):
     loop = get_event_loop()
     return loop.run_until_complete(func(*args, **kwargs))
 
+# ==================== LIVE LOGS ====================
+def add_log(message, type='info'):
+    global live_logs
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    live_logs.append({
+        'time': timestamp,
+        'message': message,
+        'type': type
+    })
+    if len(live_logs) > max_logs:
+        live_logs = live_logs[-max_logs:]
+    print(f"[{timestamp}] {message}")
+
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -53,7 +68,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🔥 FF Token Manager</title>
+    <title>🔥 FF Token Manager - Live</title>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Poppins:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -97,7 +112,7 @@ HTML_TEMPLATE = '''
             position: relative;
             z-index: 1;
             width: 100%;
-            max-width: 600px;
+            max-width: 700px;
             margin: 0 auto;
         }
         .card {
@@ -348,6 +363,7 @@ HTML_TEMPLATE = '''
             cursor: pointer;
             transition: all 0.3s ease;
             font-size: 12px;
+            display: none;
         }
         .auto-check-btn:hover {
             border-color: #ff6b35;
@@ -372,6 +388,36 @@ HTML_TEMPLATE = '''
             font-size: 16px;
             color: rgba(255,255,255,0.5);
         }
+        /* Live Console */
+        .console-section {
+            background: rgba(0,0,0,0.4);
+            border-radius: 15px;
+            padding: 15px;
+            margin-top: 20px;
+            border: 1px solid rgba(255,107,53,0.1);
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .console-section h3 {
+            color: #fff;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .console-line {
+            padding: 3px 5px;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            color: rgba(255,255,255,0.7);
+        }
+        .console-line .time {
+            color: rgba(255,107,53,0.6);
+            margin-right: 10px;
+        }
+        .console-line .type-success { color: #00ff88; }
+        .console-line .type-error { color: #ff4444; }
+        .console-line .type-info { color: #ff6b35; }
+        .console-line .type-token { color: #ffdd00; }
         .tokens-section { margin-top: 20px; }
         .tokens-section h3 {
             color: #fff;
@@ -386,6 +432,11 @@ HTML_TEMPLATE = '''
             margin-bottom: 10px;
             cursor: pointer;
             transition: all 0.3s ease;
+            animation: slideIn 0.3s ease;
+        }
+        @keyframes slideIn {
+            0% { opacity: 0; transform: translateY(-10px); }
+            100% { opacity: 1; transform: translateY(0); }
         }
         .token-item:hover {
             border-color: rgba(255,107,53,0.3);
@@ -486,6 +537,26 @@ HTML_TEMPLATE = '''
         .resend-btn:hover {
             color: #ff4500;
         }
+        .new-token-flash {
+            animation: flash 0.5s ease 3;
+        }
+        @keyframes flash {
+            0%,100% { border-color: rgba(255,107,53,0.3); }
+            50% { border-color: #ff6b35; box-shadow: 0 0 30px rgba(255,107,53,0.3); }
+        }
+        .live-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #00ff88;
+            margin-right: 8px;
+            animation: pulse 1s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%,100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.8); }
+        }
         @media (max-width: 480px) {
             .container { padding: 10px; }
             .card { padding: 20px 15px; }
@@ -493,8 +564,7 @@ HTML_TEMPLATE = '''
             .login-btn { width: 100%; }
             .otp-input { flex-direction: column; }
             .otp-input .verify-btn { width: 100%; }
-            .auto-check-controls { flex-wrap: wrap; }
-            .auto-check-btn { flex: 1; min-width: 60px; }
+            .console-section { max-height: 200px; }
         }
     </style>
 </head>
@@ -506,7 +576,7 @@ HTML_TEMPLATE = '''
             <div class="logo">
                 <div class="logo-icon">🔑</div>
                 <h1>FF TOKEN MANAGER</h1>
-                <p>JWT Token Generator & Manager</p>
+                <p>Live Token Monitor & JWT Generator</p>
             </div>
 
             <div class="login-section">
@@ -539,20 +609,23 @@ HTML_TEMPLATE = '''
 
             <div class="auto-check-section">
                 <div class="auto-check-header">
-                    <h3>⏱️ Auto Token Check</h3>
-                    <div class="auto-check-controls">
-                        <button class="auto-check-btn" onclick="startAutoCheck()">▶️ Start</button>
-                        <button class="auto-check-btn" onclick="stopAutoCheck()">⏹️ Stop</button>
-                        <button class="auto-check-btn" onclick="checkNow()">🔄 Check Now</button>
+                    <h3><span class="live-dot" id="liveDot"></span> Live Monitor</h3>
+                    <div style="color:rgba(255,255,255,0.3);font-size:12px;">
+                        <span id="checkCount">Checks: 0</span> | 
+                        <span id="lastCheck">Last: Never</span>
                     </div>
                 </div>
                 <div class="timer-display" id="timerDisplay">
-                    ⏳ Not Running
+                    ⏳ Waiting for login...
                     <div class="time" id="timerDetail"></div>
                 </div>
-                <div style="text-align:center;color:rgba(255,255,255,0.3);font-size:12px;">
-                    <span id="checkCount">Checks: 0</span> | 
-                    <span id="lastCheck">Last: Never</span>
+            </div>
+
+            <!-- Live Console -->
+            <div class="console-section" id="consoleSection">
+                <h3>📺 Live Console</h3>
+                <div id="consoleLogs">
+                    <div class="console-line"><span class="time">[--:--:--]</span> <span style="color:rgba(255,255,255,0.3);">Waiting for activity...</span></div>
                 </div>
             </div>
 
@@ -560,7 +633,7 @@ HTML_TEMPLATE = '''
                 <h3>📋 Captured Tokens</h3>
                 <div id="tokensList">
                     <div style="color:rgba(255,255,255,0.3);text-align:center;padding:20px;">
-                        No tokens captured yet. Login to start capturing.
+                        No tokens captured yet. Login to start monitoring.
                     </div>
                 </div>
             </div>
@@ -570,24 +643,26 @@ HTML_TEMPLATE = '''
     <script>
         const API_BASE = '';
         let checkInterval = null;
-        let isRunning = false;
         let checkCount = 0;
         let pendingPhone = null;
         let pendingPhoneCodeHash = null;
-
-        // ==================== TIMER ====================
         let startTime = null;
         let timerInterval = null;
+        let tokenCount = 0;
 
+        // ==================== TIMER ====================
         function startTimer() {
             startTime = Date.now();
             if (timerInterval) clearInterval(timerInterval);
             timerInterval = setInterval(() => {
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                const mins = Math.floor(elapsed / 60);
+                const hours = Math.floor(elapsed / 3600);
+                const mins = Math.floor((elapsed % 3600) / 60);
                 const secs = elapsed % 60;
-                document.getElementById('timerDetail').textContent = 
-                    `Running for ${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+                let timeStr = '';
+                if (hours > 0) timeStr += `${String(hours).padStart(2, '0')}:`;
+                timeStr += `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+                document.getElementById('timerDetail').textContent = `Running for ${timeStr}`;
             }, 1000);
         }
 
@@ -607,6 +682,21 @@ HTML_TEMPLATE = '''
             setTimeout(() => { toast.className = 'toast'; }, 5000);
         }
 
+        // ==================== CONSOLE LOG ====================
+        function addConsoleLog(message, type = 'info') {
+            const container = document.getElementById('consoleLogs');
+            const time = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.className = 'console-line';
+            div.innerHTML = `<span class="time">[${time}]</span> <span class="type-${type}">${message}</span>`;
+            container.appendChild(div);
+            // Keep only last 50 logs
+            while (container.children.length > 50) {
+                container.removeChild(container.firstChild);
+            }
+            container.scrollTop = container.scrollHeight;
+        }
+
         // ==================== LOGIN ====================
         async function checkLoginStatus() {
             try {
@@ -617,15 +707,15 @@ HTML_TEMPLATE = '''
                     document.getElementById('loggedUser').textContent = data.username || data.phone;
                     document.getElementById('loginInput').style.display = 'none';
                     document.getElementById('otpSection').classList.remove('active');
-                    showToast('✅ Already logged in!', 'success');
+                    document.getElementById('timerDisplay').innerHTML = '🟢 Running <div class="time" id="timerDetail">Starting...</div>';
+                    startTimer();
+                    addConsoleLog('✅ Logged in successfully', 'success');
                     loadTokens();
-                    // Auto start check if logged in
-                    if (!isRunning) {
-                        startAutoCheck();
-                    }
+                    startAutoCheck();
                 } else {
                     document.getElementById('loginStatus').classList.remove('active');
                     document.getElementById('loginInput').style.display = 'flex';
+                    document.getElementById('timerDisplay').innerHTML = '⏳ Waiting for login...<div class="time" id="timerDetail"></div>';
                 }
             } catch (error) {
                 console.error('Status check error:', error);
@@ -639,6 +729,9 @@ HTML_TEMPLATE = '''
                 document.getElementById('loginInput').style.display = 'flex';
                 document.getElementById('tokensList').innerHTML = '<div style="color:rgba(255,255,255,0.3);text-align:center;padding:20px;">Logged out. Login to start capturing.</div>';
                 stopTimer();
+                if (checkInterval) { clearInterval(checkInterval); checkInterval = null; }
+                document.getElementById('timerDisplay').innerHTML = '⏳ Waiting for login...<div class="time" id="timerDetail"></div>';
+                addConsoleLog('🔴 Logged out', 'error');
                 showToast('✅ Logged out successfully', 'success');
             } catch (error) {
                 showToast('❌ Logout failed', 'error');
@@ -656,6 +749,7 @@ HTML_TEMPLATE = '''
             
             status.innerHTML = '<div class="spinner"></div> Sending OTP...';
             status.className = 'status-text info';
+            addConsoleLog(`📤 Sending OTP to ${phone}`, 'info');
             
             try {
                 const response = await fetch('/api/login', {
@@ -673,8 +767,11 @@ HTML_TEMPLATE = '''
                     document.getElementById('loginStatus').classList.add('active');
                     document.getElementById('loggedUser').textContent = data.username || phone;
                     document.getElementById('loginInput').style.display = 'none';
+                    document.getElementById('timerDisplay').innerHTML = '🟢 Running <div class="time" id="timerDetail">Starting...</div>';
+                    startTimer();
+                    addConsoleLog(`✅ Already logged in as ${data.username}`, 'success');
                     loadTokens();
-                    if (!isRunning) startAutoCheck();
+                    startAutoCheck();
                 } else if (data.need_code) {
                     pendingPhone = phone;
                     pendingPhoneCodeHash = data.phone_code_hash;
@@ -682,15 +779,18 @@ HTML_TEMPLATE = '''
                     status.className = 'status-text success';
                     document.getElementById('otpSection').classList.add('active');
                     document.getElementById('otpInput').focus();
+                    addConsoleLog('📱 OTP sent to Telegram', 'info');
                     showToast('📱 OTP sent to your Telegram!', 'success');
                 } else {
                     status.innerHTML = '❌ ' + data.message;
                     status.className = 'status-text error';
+                    addConsoleLog(`❌ ${data.message}`, 'error');
                     showToast('❌ ' + data.message, 'error');
                 }
             } catch (error) {
                 status.innerHTML = '❌ Connection error';
                 status.className = 'status-text error';
+                addConsoleLog('❌ Connection error', 'error');
                 showToast('❌ Connection error', 'error');
             }
         }
@@ -711,6 +811,7 @@ HTML_TEMPLATE = '''
             
             status.innerHTML = '<div class="spinner"></div> Verifying OTP...';
             status.className = 'status-text info';
+            addConsoleLog('🔑 Verifying OTP...', 'info');
             
             try {
                 const response = await fetch('/api/verify', {
@@ -733,11 +834,15 @@ HTML_TEMPLATE = '''
                     document.getElementById('loginStatus').classList.add('active');
                     document.getElementById('loggedUser').textContent = data.username || pendingPhone;
                     document.getElementById('loginInput').style.display = 'none';
+                    document.getElementById('timerDisplay').innerHTML = '🟢 Running <div class="time" id="timerDetail">Starting...</div>';
+                    startTimer();
+                    addConsoleLog(`✅ Logged in as ${data.username}`, 'success');
                     loadTokens();
-                    if (!isRunning) startAutoCheck();
+                    startAutoCheck();
                 } else {
                     status.innerHTML = '❌ ' + data.message;
                     status.className = 'status-text error';
+                    addConsoleLog(`❌ ${data.message}`, 'error');
                     showToast('❌ ' + data.message, 'error');
                     if (data.message.includes('expired')) {
                         document.getElementById('otpSection').classList.remove('active');
@@ -747,6 +852,7 @@ HTML_TEMPLATE = '''
             } catch (error) {
                 status.innerHTML = '❌ Connection error';
                 status.className = 'status-text error';
+                addConsoleLog('❌ Connection error', 'error');
                 showToast('❌ Connection error', 'error');
             }
         }
@@ -762,9 +868,13 @@ HTML_TEMPLATE = '''
                     return;
                 }
                 let html = '';
+                const isNew = data.tokens.length > tokenCount;
+                tokenCount = data.tokens.length;
+                
                 data.tokens.forEach((token, index) => {
                     const jwtShort = token.jwt ? token.jwt.substring(0, 30) + '...' : 'No JWT';
-                    html += `<div class="token-item" onclick="toggleJWT(${index})">
+                    const isLatest = index === 0;
+                    html += `<div class="token-item ${isLatest && isNew ? 'new-token-flash' : ''}" onclick="toggleJWT(${index})">
                         <div style="display:flex;justify-content:space-between;align-items:center;">
                             <div>
                                 <div class="uid">🆔 ${token.uid || 'N/A'}</div>
@@ -783,6 +893,12 @@ HTML_TEMPLATE = '''
                     </div>`;
                 });
                 container.innerHTML = html;
+                
+                if (isNew && data.tokens.length > 0) {
+                    const latest = data.tokens[0];
+                    addConsoleLog(`🔑 New token captured! UID: ${latest.uid || 'N/A'}`, 'token');
+                    showToast(`🔑 New token captured! UID: ${latest.uid || 'N/A'}`, 'success');
+                }
             } catch (error) { console.error('Load tokens error:', error); }
         }
 
@@ -794,40 +910,26 @@ HTML_TEMPLATE = '''
         function copyJWT(jwt) {
             navigator.clipboard.writeText(jwt).then(() => {
                 showToast('✅ JWT copied to clipboard!', 'success');
+                addConsoleLog('📋 JWT copied to clipboard', 'info');
             }).catch(() => {
                 showToast('❌ Failed to copy', 'error');
             });
         }
 
         // ==================== AUTO CHECK ====================
-        async function startAutoCheck() {
-            if (isRunning) { return; }
+        function startAutoCheck() {
+            if (checkInterval) { clearInterval(checkInterval); }
             
-            const response = await fetch('/api/start-check', { method: 'POST' });
-            const data = await response.json();
-            if (data.success) {
-                isRunning = true;
-                document.getElementById('timerDisplay').innerHTML = '⏱️ Running <div class="time" id="timerDetail">Starting...</div>';
-                document.querySelector('.auto-check-btn.running')?.classList.remove('running');
-                document.querySelectorAll('.auto-check-btn')[0].classList.add('running');
-                startTimer();
-                
-                if (checkInterval) clearInterval(checkInterval);
-                checkInterval = setInterval(() => { checkNow(); }, 5000); // Check every 5 seconds
-                
-                // Immediate first check
-                setTimeout(() => checkNow(), 1000);
-            }
-        }
-
-        function stopAutoCheck() {
-            fetch('/api/stop-check', { method: 'POST' });
-            if (checkInterval) { clearInterval(checkInterval); checkInterval = null; }
-            isRunning = false;
-            document.getElementById('timerDisplay').innerHTML = '⏳ Stopped <div class="time" id="timerDetail"></div>';
-            document.querySelector('.auto-check-btn.running')?.classList.remove('running');
-            stopTimer();
-            showToast('⏹️ Auto check stopped', 'info');
+            document.getElementById('timerDisplay').innerHTML = '🟢 Running <div class="time" id="timerDetail">Starting...</div>';
+            startTimer();
+            addConsoleLog('🔄 Live monitor started (checking every 3 seconds)', 'info');
+            
+            // First check immediately
+            setTimeout(() => checkNow(), 500);
+            
+            checkInterval = setInterval(() => {
+                checkNow();
+            }, 3000); // Check every 3 seconds
         }
 
         async function checkNow() {
@@ -838,9 +940,11 @@ HTML_TEMPLATE = '''
             try {
                 const response = await fetch('/api/check-token');
                 const data = await response.json();
+                
                 if (data.new_token) {
-                    showToast('🔑 New token captured!', 'success');
+                    addConsoleLog(`🔑 New token captured! UID: ${data.token?.uid || 'N/A'}`, 'token');
                     loadTokens();
+                    showToast('🔑 New token captured!', 'success');
                 }
             } catch (error) {
                 console.error('Check error:', error);
@@ -860,7 +964,8 @@ HTML_TEMPLATE = '''
         // ==================== INIT ====================
         document.addEventListener('DOMContentLoaded', function() {
             checkLoginStatus();
-            showToast('🔥 Welcome! Auto-check starts on login', 'success');
+            addConsoleLog('🔥 FF Token Manager started', 'info');
+            showToast('🔥 Live monitor active!', 'success');
         });
     </script>
 </body>
@@ -892,6 +997,7 @@ async def do_login(phone, code=None, phone_code_hash=None):
             sessions_store[phone] = client.session.save()
             if phone in pending_data:
                 del pending_data[phone]
+            add_log(f"Already logged in as {me.first_name}", 'success')
             return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
         
         if code and phone_code_hash:
@@ -901,35 +1007,48 @@ async def do_login(phone, code=None, phone_code_hash=None):
                 sessions_store[phone] = client.session.save()
                 if phone in pending_data:
                     del pending_data[phone]
+                add_log(f"Logged in as {me.first_name}", 'success')
                 return {"success": True, "message": f"Logged in as {me.first_name}", "username": me.username}
             except errors.rpcerrorlist.PhoneCodeInvalidError:
+                add_log("Invalid verification code", 'error')
                 return {"success": False, "message": "Invalid verification code"}
             except errors.rpcerrorlist.PhoneCodeExpiredError:
+                add_log("Verification code expired", 'error')
                 return {"success": False, "message": "Verification code expired. Please request new OTP."}
             except errors.rpcerrorlist.SessionPasswordNeededError:
+                add_log("2FA is enabled", 'info')
                 return {"success": False, "message": "2FA is enabled", "need_2fa": True}
             except Exception as e:
+                add_log(f"Login error: {str(e)}", 'error')
                 return {"success": False, "message": str(e)}
         else:
             try:
                 send_code_result = await client.send_code_request(phone)
                 phone_code_hash = send_code_result.phone_code_hash
                 pending_data[phone] = {"client": client, "phone_code_hash": phone_code_hash}
+                add_log(f"OTP sent to {phone}", 'info')
                 return {"success": False, "need_code": True, "message": "OTP sent to Telegram", "phone_code_hash": phone_code_hash}
             except errors.rpcerrorlist.PhoneNumberInvalidError:
+                add_log(f"Invalid phone number: {phone}", 'error')
                 return {"success": False, "message": "Invalid phone number"}
             except errors.rpcerrorlist.FloodWaitError as e:
+                add_log(f"Flood wait: {e.seconds}s", 'error')
                 return {"success": False, "message": f"Too many attempts. Please wait {e.seconds} seconds."}
             except Exception as e:
+                add_log(f"Send code error: {str(e)}", 'error')
                 return {"success": False, "message": str(e)}
             
     except errors.rpcerrorlist.PhoneNumberInvalidError:
+        add_log(f"Invalid phone number: {phone}", 'error')
         return {"success": False, "message": "Invalid phone number"}
     except errors.rpcerrorlist.PhoneCodeInvalidError:
+        add_log("Invalid verification code", 'error')
         return {"success": False, "message": "Invalid verification code"}
     except errors.rpcerrorlist.PhoneCodeExpiredError:
+        add_log("Verification code expired", 'error')
         return {"success": False, "message": "Verification code expired. Please request new OTP."}
     except Exception as e:
+        add_log(f"Login error: {str(e)}", 'error')
         return {"success": False, "message": str(e)}
 
 async def do_capture_token():
@@ -946,6 +1065,7 @@ async def do_capture_token():
         await client.connect()
         
         if not await client.is_user_authorized():
+            add_log("Session expired", 'error')
             return {"success": False, "message": "Session expired"}
         
         # Get last message ID to check for new messages
@@ -976,6 +1096,8 @@ async def do_capture_token():
                         if token.get('access_token') == access_token:
                             return {"success": True, "message": "Token already captured", "new": False}
                     
+                    add_log(f"New access token detected: {access_token[:20]}...", 'token')
+                    
                     # Get JWT from API
                     jwt = None
                     uid = None
@@ -994,8 +1116,9 @@ async def do_capture_token():
                                     name = base64.b64decode(name).decode('utf-8')
                                 except:
                                     pass
+                            add_log(f"JWT generated for UID: {uid}", 'success')
                     except Exception as e:
-                        print(f"JWT API error: {e}")
+                        add_log(f"JWT API error: {str(e)}", 'error')
                     
                     token_data = {
                         "open_id": open_id,
@@ -1014,19 +1137,22 @@ async def do_capture_token():
         return {"success": True, "message": "No new token found", "new": False}
         
     except Exception as e:
+        add_log(f"Capture error: {str(e)}", 'error')
         return {"success": False, "message": str(e)}
 
 # ==================== BACKGROUND CHECK THREAD ====================
 def background_check():
     global checking_active
+    add_log("Background monitor started (3s interval)", 'info')
     while checking_active:
         try:
             result = run_async(do_capture_token)
             if result.get('new'):
-                print(f"[NEW TOKEN] {result.get('token', {}).get('uid')}")
+                token = result.get('token', {})
+                add_log(f"🔑 TOKEN CAPTURED! UID: {token.get('uid', 'N/A')}", 'token')
         except Exception as e:
-            print(f"[ERROR] {e}")
-        time.sleep(5)  # Check every 5 seconds
+            add_log(f"Background error: {str(e)}", 'error')
+        time.sleep(3)  # Check every 3 seconds
 
 def start_background_check():
     global checking_active, check_thread
@@ -1035,11 +1161,13 @@ def start_background_check():
     checking_active = True
     check_thread = threading.Thread(target=background_check, daemon=True)
     check_thread.start()
+    add_log("✅ Background monitor started", 'success')
     return {"success": True, "message": "Started"}
 
 def stop_background_check():
     global checking_active
     checking_active = False
+    add_log("⏹️ Background monitor stopped", 'info')
     return {"success": True, "message": "Stopped"}
 
 # ==================== FLASK ROUTES ====================
@@ -1060,6 +1188,7 @@ def api_status():
         "check_count": check_count,
         "last_check": last_check_time,
         "is_checking": checking_active,
+        "logs": live_logs[-20:],
         "timestamp": datetime.now().isoformat()
     })
 
@@ -1076,6 +1205,7 @@ def api_logout():
     pending_data.clear()
     last_message_id.clear()
     stop_background_check()
+    add_log("User logged out", 'info')
     return jsonify({"success": True, "message": "Logged out"})
 
 @app.route('/api/login', methods=['POST'])
@@ -1085,6 +1215,8 @@ def api_login():
     if not phone:
         return jsonify({"success": False, "message": "Phone required"}), 400
     result = run_async(do_login, phone)
+    if result.get('success'):
+        start_background_check()
     return jsonify(result)
 
 @app.route('/api/verify', methods=['POST'])
@@ -1096,6 +1228,8 @@ def api_verify():
     if not phone or not code:
         return jsonify({"success": False, "message": "Phone and code required"}), 400
     result = run_async(do_login, phone, code, phone_code_hash)
+    if result.get('success'):
+        start_background_check()
     return jsonify(result)
 
 @app.route('/api/check-token')
@@ -1106,6 +1240,10 @@ def api_check_token():
 @app.route('/api/tokens')
 def api_tokens():
     return jsonify({"success": True, "tokens": tokens_store})
+
+@app.route('/api/logs')
+def api_logs():
+    return jsonify({"success": True, "logs": live_logs[-50:]})
 
 @app.route('/api/start-check', methods=['POST'])
 def api_start_check():
@@ -1122,12 +1260,13 @@ def handler(request, context):
 # ==================== MAIN ====================
 if __name__ == '__main__':
     print("=" * 60)
-    print("🔥 FF TOKEN MANAGER - Production Ready")
+    print("🔥 FF TOKEN MANAGER - Live Monitor")
     print("=" * 60)
     print(f"📱 Phone: {USER_PHONE}")
     print(f"🤖 Target Bot: @{TARGET_BOT}")
     print(f"🔑 JWT API: {JWT_API}")
     print("=" * 60)
     print("🌐 Server running at http://localhost:5000")
+    print("📺 Live Console active - checks every 3 seconds")
     print("=" * 60)
     app.run(host='0.0.0.0', port=5000, debug=True)
