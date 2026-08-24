@@ -23,7 +23,7 @@ app.secret_key = os.environ.get('SECRET_KEY', 'ff-token-manager-secret-key-2024'
 # ==================== IN-MEMORY STORAGE ====================
 tokens_store = []
 sessions_store = {}
-pending_clients = {}
+pending_data = {}  # phone: {"client": client, "phone_code_hash": hash}
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
@@ -156,6 +156,34 @@ HTML_TEMPLATE = '''
             color: #fff;
             font-size: 16px;
             margin-bottom: 15px;
+        }
+        .login-status {
+            background: rgba(0,255,136,0.05);
+            border: 1px solid rgba(0,255,136,0.1);
+            border-radius: 12px;
+            padding: 10px 15px;
+            margin-bottom: 10px;
+            display: none;
+        }
+        .login-status.active {
+            display: block;
+        }
+        .login-status .user {
+            color: #00ff88;
+            font-weight: 600;
+        }
+        .login-status .logout-btn {
+            background: rgba(255,68,68,0.1);
+            border: 1px solid rgba(255,68,68,0.2);
+            border-radius: 8px;
+            color: #ff4444;
+            padding: 4px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .login-status .logout-btn:hover {
+            background: rgba(255,68,68,0.2);
         }
         .login-input {
             display: flex;
@@ -451,7 +479,13 @@ HTML_TEMPLATE = '''
 
             <div class="login-section">
                 <h3>🔐 Login to Telegram</h3>
-                <div class="login-input">
+                
+                <div class="login-status" id="loginStatus">
+                    <span>✅ Logged in as: <span class="user" id="loggedUser">Loading...</span></span>
+                    <button class="logout-btn" onclick="logout()">Logout</button>
+                </div>
+                
+                <div class="login-input" id="loginInput">
                     <input type="text" id="phoneInput" placeholder="+917970462807" value="+917970462807">
                     <button class="login-btn" onclick="sendOTP()">📤 Send OTP</button>
                 </div>
@@ -513,6 +547,38 @@ HTML_TEMPLATE = '''
             setTimeout(() => { toast.className = 'toast'; }, 5000);
         }
 
+        async function checkLoginStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                if (data.logged_in && data.username) {
+                    document.getElementById('loginStatus').classList.add('active');
+                    document.getElementById('loggedUser').textContent = data.username || data.phone;
+                    document.getElementById('loginInput').style.display = 'none';
+                    document.getElementById('otpSection').classList.remove('active');
+                    showToast('✅ Already logged in!', 'success');
+                    loadTokens();
+                } else {
+                    document.getElementById('loginStatus').classList.remove('active');
+                    document.getElementById('loginInput').style.display = 'flex';
+                }
+            } catch (error) {
+                console.error('Status check error:', error);
+            }
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+                document.getElementById('loginStatus').classList.remove('active');
+                document.getElementById('loginInput').style.display = 'flex';
+                document.getElementById('tokensList').innerHTML = '<div style="color:rgba(255,255,255,0.3);text-align:center;padding:20px;">Logged out. Login to start capturing.</div>';
+                showToast('✅ Logged out successfully', 'success');
+            } catch (error) {
+                showToast('❌ Logout failed', 'error');
+            }
+        }
+
         async function sendOTP() {
             const phone = document.getElementById('phoneInput').value.trim();
             const status = document.getElementById('statusText');
@@ -538,6 +604,9 @@ HTML_TEMPLATE = '''
                     status.className = 'status-text success';
                     showToast('✅ Already logged in!', 'success');
                     document.getElementById('otpSection').classList.remove('active');
+                    document.getElementById('loginStatus').classList.add('active');
+                    document.getElementById('loggedUser').textContent = data.username || phone;
+                    document.getElementById('loginInput').style.display = 'none';
                     loadTokens();
                 } else if (data.need_code) {
                     pendingPhone = phone;
@@ -594,6 +663,9 @@ HTML_TEMPLATE = '''
                     showToast('✅ Login successful!', 'success');
                     document.getElementById('otpSection').classList.remove('active');
                     document.getElementById('otpInput').value = '';
+                    document.getElementById('loginStatus').classList.add('active');
+                    document.getElementById('loggedUser').textContent = data.username || pendingPhone;
+                    document.getElementById('loginInput').style.display = 'none';
                     loadTokens();
                 } else {
                     status.innerHTML = '❌ ' + data.message;
@@ -601,7 +673,6 @@ HTML_TEMPLATE = '''
                     showToast('❌ ' + data.message, 'error');
                     if (data.message.includes('expired')) {
                         document.getElementById('otpSection').classList.remove('active');
-                        // Auto resend OTP after expiry
                         setTimeout(() => {
                             sendOTP();
                         }, 2000);
@@ -713,7 +784,7 @@ HTML_TEMPLATE = '''
         });
 
         document.addEventListener('DOMContentLoaded', function() {
-            loadTokens();
+            checkLoginStatus();
             showToast('🔥 Welcome! Enter phone and click Send OTP', 'success');
         });
     </script>
@@ -721,14 +792,18 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# ==================== TELEGRAM FUNCTIONS ====================
+# ==================== FIXED TELEGRAM FUNCTIONS ====================
 async def do_login(phone, code=None, phone_code_hash=None):
     try:
         # Check if we have a pending client
         client = None
-        if phone in pending_clients:
-            client = pending_clients[phone]
-        else:
+        phone_code_hash_to_use = phone_code_hash
+        
+        if phone in pending_data:
+            client = pending_data[phone].get('client')
+            phone_code_hash_to_use = pending_data[phone].get('phone_code_hash')
+        
+        if client is None:
             session_str = sessions_store.get(phone)
             if session_str:
                 client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
@@ -736,20 +811,22 @@ async def do_login(phone, code=None, phone_code_hash=None):
                 client = TelegramClient(StringSession(), API_ID, API_HASH)
             await client.connect()
         
+        # Check if already authorized
         if await client.is_user_authorized():
             me = await client.get_me()
             sessions_store[phone] = client.session.save()
-            if phone in pending_clients:
-                del pending_clients[phone]
+            if phone in pending_data:
+                del pending_data[phone]
             return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
         
-        if code and phone_code_hash:
+        # If code provided, verify
+        if code and phone_code_hash_to_use:
             try:
-                await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                await client.sign_in(phone, code, phone_code_hash=phone_code_hash_to_use)
                 me = await client.get_me()
                 sessions_store[phone] = client.session.save()
-                if phone in pending_clients:
-                    del pending_clients[phone]
+                if phone in pending_data:
+                    del pending_data[phone]
                 return {"success": True, "message": f"Logged in as {me.first_name}", "username": me.username}
             except errors.rpcerrorlist.PhoneCodeInvalidError:
                 return {"success": False, "message": "Invalid verification code"}
@@ -760,14 +837,11 @@ async def do_login(phone, code=None, phone_code_hash=None):
             except Exception as e:
                 return {"success": False, "message": str(e)}
         else:
+            # Send code request
             try:
-                # Connect if not already
-                if not client.is_connected():
-                    await client.connect()
-                
                 send_code_result = await client.send_code_request(phone)
                 phone_code_hash = send_code_result.phone_code_hash
-                pending_clients[phone] = client
+                pending_data[phone] = {"client": client, "phone_code_hash": phone_code_hash}
                 return {"success": False, "need_code": True, "message": "OTP sent to Telegram", "phone_code_hash": phone_code_hash}
             except errors.rpcerrorlist.PhoneNumberInvalidError:
                 return {"success": False, "message": "Invalid phone number"}
@@ -859,12 +933,22 @@ def index():
 
 @app.route('/api/status')
 def api_status():
+    phone = list(sessions_store.keys())[0] if sessions_store else None
     return jsonify({
         "status": "ok",
-        "timestamp": datetime.now().isoformat(),
+        "logged_in": len(sessions_store) > 0,
+        "phone": phone,
+        "username": "Logged In" if sessions_store else None,
         "tokens_count": len(tokens_store),
-        "sessions_count": len(sessions_store)
+        "sessions_count": len(sessions_store),
+        "timestamp": datetime.now().isoformat()
     })
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    sessions_store.clear()
+    pending_data.clear()
+    return jsonify({"success": True, "message": "Logged out"})
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
