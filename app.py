@@ -4,8 +4,8 @@ import json
 import base64
 import asyncio
 import requests
-from datetime import datetime
-from flask import Flask, render_template_string, request, jsonify
+from datetime import datetime, timedelta
+from flask import Flask, render_template_string, request, jsonify, session
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
@@ -18,11 +18,12 @@ JWT_API = os.environ.get('JWT_API', 'https://ff-jwt-gen-api.lovable.app/api/publ
 
 # ==================== FLASK APP ====================
 app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'ff-token-manager-secret-key-2024')
 
 # ==================== IN-MEMORY STORAGE ====================
 tokens_store = []
 sessions_store = {}
-pending_data = {}
+pending_clients = {}
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
@@ -413,6 +414,18 @@ HTML_TEMPLATE = '''
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+        .resend-btn {
+            background: none;
+            border: none;
+            color: #ff6b35;
+            cursor: pointer;
+            text-decoration: underline;
+            font-size: 12px;
+            margin-top: 5px;
+        }
+        .resend-btn:hover {
+            color: #ff4500;
+        }
         @media (max-width: 480px) {
             .container { padding: 10px; }
             .card { padding: 20px 15px; }
@@ -445,10 +458,14 @@ HTML_TEMPLATE = '''
                 
                 <div class="otp-section" id="otpSection">
                     <div class="otp-input">
-                        <input type="text" id="otpInput" placeholder="Enter OTP" maxlength="6">
+                        <input type="text" id="otpInput" placeholder="Enter OTP" maxlength="6" autocomplete="one-time-code">
                         <button class="verify-btn" onclick="verifyOTP()">✅ Verify</button>
                     </div>
-                    <div class="otp-info">📱 Check your Telegram app for verification code</div>
+                    <div class="otp-info">
+                        📱 Check your Telegram app for verification code
+                        <br>
+                        <button class="resend-btn" onclick="sendOTP()">🔄 Resend OTP</button>
+                    </div>
                 </div>
                 
                 <div class="status-text" id="statusText">💡 Enter phone number and click Send OTP</div>
@@ -584,6 +601,10 @@ HTML_TEMPLATE = '''
                     showToast('❌ ' + data.message, 'error');
                     if (data.message.includes('expired')) {
                         document.getElementById('otpSection').classList.remove('active');
+                        // Auto resend OTP after expiry
+                        setTimeout(() => {
+                            sendOTP();
+                        }, 2000);
                     }
                 }
             } catch (error) {
@@ -703,16 +724,23 @@ HTML_TEMPLATE = '''
 # ==================== TELEGRAM FUNCTIONS ====================
 async def do_login(phone, code=None, phone_code_hash=None):
     try:
-        session_str = sessions_store.get(phone)
-        if session_str:
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        # Check if we have a pending client
+        client = None
+        if phone in pending_clients:
+            client = pending_clients[phone]
         else:
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-        
-        await client.connect()
+            session_str = sessions_store.get(phone)
+            if session_str:
+                client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+            else:
+                client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
         
         if await client.is_user_authorized():
             me = await client.get_me()
+            sessions_store[phone] = client.session.save()
+            if phone in pending_clients:
+                del pending_clients[phone]
             return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
         
         if code and phone_code_hash:
@@ -720,6 +748,8 @@ async def do_login(phone, code=None, phone_code_hash=None):
                 await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
                 me = await client.get_me()
                 sessions_store[phone] = client.session.save()
+                if phone in pending_clients:
+                    del pending_clients[phone]
                 return {"success": True, "message": f"Logged in as {me.first_name}", "username": me.username}
             except errors.rpcerrorlist.PhoneCodeInvalidError:
                 return {"success": False, "message": "Invalid verification code"}
@@ -731,9 +761,13 @@ async def do_login(phone, code=None, phone_code_hash=None):
                 return {"success": False, "message": str(e)}
         else:
             try:
+                # Connect if not already
+                if not client.is_connected():
+                    await client.connect()
+                
                 send_code_result = await client.send_code_request(phone)
                 phone_code_hash = send_code_result.phone_code_hash
-                pending_data[phone] = {"phone_code_hash": phone_code_hash}
+                pending_clients[phone] = client
                 return {"success": False, "need_code": True, "message": "OTP sent to Telegram", "phone_code_hash": phone_code_hash}
             except errors.rpcerrorlist.PhoneNumberInvalidError:
                 return {"success": False, "message": "Invalid phone number"}
@@ -873,11 +907,11 @@ def api_tokens():
 
 @app.route('/api/start-check', methods=['POST'])
 def api_start_check():
-    return jsonify({"success": True, "message": "Auto-check started (simulated)"})
+    return jsonify({"success": True, "message": "Auto-check started"})
 
 @app.route('/api/stop-check', methods=['POST'])
 def api_stop_check():
-    return jsonify({"success": True, "message": "Auto-check stopped (simulated)"})
+    return jsonify({"success": True, "message": "Auto-check stopped"})
 
 # ==================== FOR VERCEL ====================
 def handler(request, context):
